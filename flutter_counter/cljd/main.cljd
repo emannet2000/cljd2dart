@@ -1,0 +1,40 @@
+(ns cljd-counter.ui
+  (:require ["ui.dart" :as ui]))
+
+(def counter (atom 0))
+
+(defn bump [delta]
+  (swap! counter + delta))
+
+(defn reset-counter []
+  (reset! counter 0))
+
+(defn counter-screen [refresh]
+  (ui/scaffold
+   (ui/appBar "cljd2dart Counter")
+   (ui/center
+    (ui/column
+     [(ui/text (str "Count: " @counter) 48.0)
+      (ui/text "UI generated from ClojureDart" 14.0)
+      (ui/row
+       [(ui/elevatedButton
+         "-1"
+         (fn []
+           (bump -1)
+           (refresh (fn [] nil))))
+        (ui/elevatedButton
+         "+1"
+         (fn []
+           (bump 1)
+           (refresh (fn [] nil))))])
+      (ui/textButton
+       "Reset"
+       (fn []
+         (reset! counter 0)
+         (refresh (fn [] nil))))]))))
+
+(defn main []
+  (ui/launch
+   (ui/materialApp
+    "cljd2dart Counter"
+    (ui/stateful counter-screen))))

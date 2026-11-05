@@ -1,0 +1,106 @@
+(ns cljd2dart.main
+  "Command line entry point for the cljd2dart transpiler."
+  (:require ["dart:io" :as io]
+            ["dart:async" :as async]
+            [cljd.reader :as reader]
+            [cljd.string :as str]
+            [cljd2dart.repl :as repl]
+            [cljd2dart.transpile :as t]))
+
+(def ^:private version "0.1.0")
+
+(defn- usage []
+  (println "cljd2dart - a small ClojureDart -> Dart source transpiler")
+  (println "")
+  (println "Usage:")
+  (println "  cljd2dart <input.cljd> [-o output.dart]")
+  (println "  cljd2dart <input.cljd> --stdout")
+  (println "  cljd2dart --repl")
+  (println "")
+  (println "Options:")
+  (println "  -o, --output <file>   Write Dart to <file>")
+  (println "      --stdout          Write Dart to standard output")
+  (println "      --repl            Start an interactive REPL")
+  (println "  -h, --help            Show this help")
+  (println "  -v, --version         Show the version")
+  (println "")
+  (println "If no output is given, the input extension is replaced with .dart.")
+  (println "Use '-' as the input path to read ClojureDart source from stdin."))
+
+(defn- read-forms [src]
+  (await (.toList (reader/read-stream (async/Stream.value src)))))
+
+(defn- read-stdin []
+  (let [sb (StringBuffer.)]
+    (loop []
+      (let [line (.readLineSync io/stdin)]
+        (if (nil? line)
+          (.toString sb)
+          (do
+            (.write sb line)
+            (.write sb "\n")
+            (recur)))))))
+
+(defn- default-output [input]
+  (cond
+    (str/ends-with? input ".cljd") (str (subs input 0 (- (count input) 5)) ".dart")
+    (str/ends-with? input ".clj") (str (subs input 0 (- (count input) 4)) ".dart")
+    :else (str input ".dart")))
+
+(defn- parse-args [args]
+  (loop [xs (vec args) input nil output nil stdout? false]
+    (if (empty? xs)
+      {:input input :output output :stdout stdout?}
+      (let [a (first xs)]
+        (cond
+          (or (= a "-h") (= a "--help"))
+          {:help true}
+
+          (or (= a "-v") (= a "--version"))
+          {:version true}
+
+          (or (= a "-o") (= a "--output"))
+          (if (> (count xs) 1)
+            (recur (vec (drop 2 xs)) input (second xs) stdout?)
+            (throw (Exception. "missing value after -o/--output")))
+
+          (= a "--stdout")
+          (recur (vec (rest xs)) input output true)
+
+          (str/starts-with? a "--")
+          (throw (Exception. (str "unknown option: " a)))
+
+          (nil? input)
+          (recur (vec (rest xs)) a output stdout?)
+
+          :else
+          (throw (Exception. (str "unexpected argument: " a))))))))
+
+(defn main [args]
+  (let [args (vec (or args []))]
+    (if (some (fn [a] (= a "--repl")) args)
+      (await (repl/repl-main))
+      (let [opts (parse-args args)]
+        (cond
+          (:help opts)
+          (usage)
+
+          (:version opts)
+          (println (str "cljd2dart " version))
+
+          (nil? (:input opts))
+          (do (usage) (io/exit 2))
+
+          :else
+          (let [input (:input opts)
+                source (if (= input "-")
+                         (read-stdin)
+                         (.readAsStringSync (io/File. input)))
+                forms (await (read-forms (t/normalize-percent-args source)))
+                dart (t/transpile-forms forms {:source-name input})
+                output (or (:output opts) (default-output input))]
+            (if (:stdout opts)
+              (print dart)
+              (do
+                (.writeAsStringSync (io/File. output) dart)
+                (println (str "wrote " output))))))))))

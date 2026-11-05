@@ -1,0 +1,10 @@
+name: cljd2dart
+description: A ClojureDart-to-Dart source transpiler written in ClojureDart.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.13.7
+
+dev_dependencies:
+  lints: ^6.0.0

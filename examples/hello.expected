@@ -1,0 +1,11 @@
+Hello, ClojureDart!
+fact(5) = 120
+sqrt(81) = 9.0
+Ada 36 1 2 [3 4]
+[1 4 9 16]
+12
+{:a 1, :b 2}
+[0 2 4 6 8]
+item 1
+item 2
+item 3

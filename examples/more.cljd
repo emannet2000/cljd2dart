@@ -1,0 +1,38 @@
+(ns more.core
+  (:require [cljd.string :as str]))
+
+(defn greet-person [{:keys [name age] :or {age 0}}]
+  (str name " is " age))
+
+(defn count-down [n]
+  ((fn step [i acc]
+     (if (<= i 0)
+       acc
+       (recur (dec i) (conj acc i))))
+   n []))
+
+(defn inc-all [xs]
+  (map inc xs))
+
+(defn main []
+  (println (greet-person {:name "Grace" :age 85}))
+  (println (count-down 5))
+  (println (->> [1 2 3 4] (map inc) (filter even?) (reduce + 0)))
+  (println (let [x 1
+                 x (+ x 10)
+                 y (* x 2)]
+             [x y]))
+  (println (set [1 1 2 3]))
+  (println (conj #{1 2} 3))
+  (println (case 7 (1 2 3) "small" (7 8) "sevenish" "other"))
+  (println (do (println "side effect") 99))
+  (println (apply + [1 2 3 4]))
+  (println ((partial + 10) 5))
+  (println ((comp inc inc) 1))
+  (println ((juxt inc dec) 10))
+  (println (sort-by count ["aaa" "b" "cc"]))
+  (println (distinct [1 2 1 3 2]))
+  (println (flatten [1 [2 [3 4]]]))
+  (println (take 2 [1 2 3]) (drop 2 [1 2 3]))
+  (println (nth [10 20] 5 :missing))
+  (println (str/join "," (map str [1 2 3]))))

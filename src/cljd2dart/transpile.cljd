@@ -1,0 +1,1357 @@
+(ns cljd2dart.transpile
+  "A small ClojureDart -> Dart source transpiler.
+
+  This is intentionally a source-to-source translator for a useful subset of
+  ClojureDart, not a replacement for the real ClojureDart compiler. It is
+  itself written in ClojureDart and is compiled with ClojureDart.
+
+  Supported highlights:
+    * ns with Dart library imports and :as/:refer
+    * def, defn, defn- (single arity)
+    * if, if-not, when, when-not, cond, do, let (with destructuring)
+    * fn / fn*, loop / recur (compiled to a local recursive function)
+    * arithmetic and comparison operators, and/or/not
+    * vectors, maps, sets, keywords, strings, quoted data
+    * Dart interop: (.method obj ...), (.-field obj), (Class/member ...)
+    * a practical subset of cljd.core / cljd.string functions
+    * -> and ->> threading macros
+    * doseq, throw, atom/swap!/reset!/deref
+  "
+  (:require [cljd.string :as str]
+            [cljd2dart.runtime-src :as rt]))
+
+(declare expr stmt top-form emit-body expand bind-pattern doseq-stmt doseq-expr)
+
+;; ---------------------------------------------------------------------------
+;; Utilities
+;; ---------------------------------------------------------------------------
+
+(def ^:private gensym-counter (atom 0))
+
+(def ^:private munge-table
+  {"-" "_"
+   "?" "_QMARK_"
+   "!" "_BANG_"
+   "*" "_STAR_"
+   "+" "_PLUS_"
+   "=" "_EQ_"
+   "<" "_LT_"
+   ">" "_GT_"
+   "/" "_SLASH_"
+   "'" "_"})
+
+(def ^:private dart-reserved
+  #{"abstract" "as" "assert" "async" "await" "base" "break" "case" "catch"
+    "class" "const" "continue" "covariant" "default" "deferred" "do" "dynamic"
+    "else" "enum" "export" "extends" "extension" "external" "factory" "false"
+    "final" "finally" "for" "Function" "get" "hide" "if" "implements" "import"
+    "in" "interface" "is" "late" "library" "mixin" "new" "null" "on" "operator"
+    "part" "required" "rethrow" "return" "sealed" "set" "show" "static" "super"
+    "switch" "sync" "this" "throw" "true" "try" "typedef" "var" "void" "when"
+    "while" "with" "yield"})
+
+(defn- munge
+  "Turn a Clojure name into a valid (and reasonably readable) Dart identifier."
+  [x]
+  (let [s (str x)
+        n (count s)
+        out (apply str
+                   (map (fn [i]
+                          (let [ch (subs s i (inc i))]
+                            (get munge-table ch ch)))
+                        (range n)))]
+    (if (contains? dart-reserved out) (str out "_") out)))
+
+(defn- fresh [base]
+  (str (munge (str base)) "_" (swap! gensym-counter inc)))
+
+(defn- spaces [n]
+  (apply str (repeat n "  ")))
+
+(defn- join-lines [xs]
+  (str/join "\n" (remove nil? xs)))
+
+(defn- dart-string [s]
+  (let [s (-> (str s)
+              (str/replace "\\" "\\\\")
+              (str/replace "'" "\\'")
+              (str/replace "$" "\\$")
+              (str/replace "\n" "\\n")
+              (str/replace "\r" "\\r")
+              (str/replace "\t" "\\t"))]
+    (str "'" s "'")))
+
+(defn- kw-expr [form]
+  (let [n (name form)
+        ns (namespace form)]
+    (if ns
+      (str "_Kw(" (dart-string n) ", " (dart-string ns) ")")
+      (str "_Kw(" (dart-string n) ")"))))
+
+(defn- symbol-kw [sym]
+  (if (namespace sym)
+    (str "_Kw(" (dart-string (name sym)) ", " (dart-string (namespace sym)) ")")
+    (str "_Kw(" (dart-string (name sym)) ")")))
+
+(defn- symbol-sym [sym]
+  (if (namespace sym)
+    (str "_Sym(" (dart-string (name sym)) ", " (dart-string (namespace sym)) ")")
+    (str "_Sym(" (dart-string (name sym)) ")")))
+
+(defn- truthy [x]
+  (str "_rt_truthy(" x ")"))
+
+(defn- unsupported [what form]
+  (throw (Exception.
+          (str "cljd2dart: " what " is not supported yet: " (pr-str form)))))
+
+;; ---------------------------------------------------------------------------
+;; Core function mapping
+;; ---------------------------------------------------------------------------
+
+(def ^:private core-value-fns
+  {"+" "_rt_variadic(_rt_add)" "-" "_rt_variadic(_rt_sub)"
+   "*" "_rt_variadic(_rt_mul)" "/" "_rt_variadic(_rt_div)"
+   "=" "_rt_variadic(_rt_eq_all)" "not=" "_rt_variadic(_rt_not_eq_all)"
+   "<" "_rt_variadic(_rt_lt_all)" ">" "_rt_variadic(_rt_gt_all)"
+   "<=" "_rt_variadic(_rt_lte_all)" ">=" "_rt_variadic(_rt_gte_all)"
+   "inc" "_rt_inc" "dec" "_rt_dec" "mod" "_rt_mod" "rem" "_rt_rem"
+   "quot" "_rt_quot" "abs" "_rt_abs"
+   "count" "_rt_count" "get" "_rt_get" "first" "_rt_first"
+   "second" "_rt_second" "last" "_rt_last" "rest" "_rt_rest"
+   "next" "_rt_next" "nth" "_rt_nth" "seq" "_rt_seq" "vec" "_rt_vec"
+   "keys" "_rt_keys" "vals" "_rt_vals" "contains?" "_rt_contains"
+   "find" "_rt_find" "conj" "_rt_variadic(_rt_conj)"
+   "assoc" "_rt_variadic(_rt_assoc)" "dissoc" "_rt_variadic(_rt_dissoc)"
+   "merge" "_rt_variadic(_rt_merge)" "into" "_rt_into"
+   "reverse" "_rt_reverse" "sort" "_rt_sort" "sort-by" "_rt_sort_by"
+   "distinct" "_rt_distinct"
+   "flatten" "_rt_flatten" "take" "_rt_take" "drop" "_rt_drop"
+   "take-while" "_rt_take_while" "drop-while" "_rt_drop_while"
+   "partition" "_rt_partition" "some" "_rt_some" "every?" "_rt_every"
+   "not-any?" "_rt_not_any" "not-every?" "_rt_not_every"
+   "empty" "_rt_empty" "compare" "_rt_compare"
+   "map" "_rt_map" "filter" "_rt_filter" "remove" "_rt_remove"
+   "reduce" "_rt_reduce3" "apply" "_rt_variadic(_rt_apply)"
+   "partial" "_rt_partial" "comp" "_rt_variadic(_rt_comp)"
+   "juxt" "_rt_variadic(_rt_juxt)" "complement" "_rt_complement"
+   "constantly" "_rt_constantly" "identity" "_rt_identity"
+   "nil?" "_rt_nil_q" "some?" "_rt_some_q" "true?" "_rt_true_q"
+   "false?" "_rt_false_q" "number?" "_rt_number_q" "integer?" "_rt_integer_q"
+   "double?" "_rt_double_q" "string?" "_rt_string_q" "keyword?" "_rt_keyword_q"
+   "symbol?" "_rt_symbol_q" "map?" "_rt_map_q" "vector?" "_rt_vector_q"
+   "list?" "_rt_list_q" "set?" "_rt_set_q" "fn?" "_rt_fn_q" "coll?" "_rt_coll_q"
+   "empty?" "_rt_empty_coll_q" "zero?" "_rt_zero_q" "pos?" "_rt_pos_q"
+   "neg?" "_rt_neg_q" "even?" "_rt_even_q" "odd?" "_rt_odd_q"
+   "keyword" "_rt_keyword" "symbol" "_rt_symbol" "name" "_rt_name"
+   "namespace" "_rt_namespace" "atom" "_rt_atom" "deref" "_rt_deref"
+   "reset!" "_rt_reset" "swap!" "_rt_swap" "boolean" "_rt_truthy"
+   "str" "_rt_variadic(_rt_str)" "pr-str" "_rt_variadic(_rt_pr_str_many)"
+   "print" "_rt_variadic(_rt_print)" "println" "_rt_variadic(_rt_println)"
+   "pr" "_rt_variadic(_rt_pr)" "prn" "_rt_variadic(_rt_prn)"
+   "min" "_rt_variadic(_rt_min)" "max" "_rt_variadic(_rt_max)"
+   "list" "_rt_variadic(_rt_list)" "vector" "_rt_variadic(_rt_list)"
+   "hash-map" "_rt_variadic(_rt_hash_map)" "set" "_rt_variadic(_rt_set)"
+   "rand" "_rt_rand"})
+
+(defn- rt-call [fname args env]
+  (str fname "(" (str/join ", " (map #(expr % env) args)) ")"))
+
+(defn- rt-list-call [fname args env]
+  (str fname "(["
+       (str/join ", " (map #(expr % env) args))
+       "])"))
+
+(defn- core-call [fname args env]
+  (let [n (count args)]
+    (cond
+      (= fname "+") (rt-list-call "_rt_add" args env)
+      (= fname "-") (rt-list-call "_rt_sub" args env)
+      (= fname "*") (rt-list-call "_rt_mul" args env)
+      (= fname "/") (rt-list-call "_rt_div" args env)
+      (= fname "=") (rt-list-call "_rt_eq_all" args env)
+      (= fname "not=") (str "(!_rt_eq_all(["
+                            (str/join ", " (map #(expr % env) args))
+                            "]))")
+      (= fname "<") (rt-list-call "_rt_lt_all" args env)
+      (= fname ">") (rt-list-call "_rt_gt_all" args env)
+      (= fname "<=") (rt-list-call "_rt_lte_all" args env)
+      (= fname ">=") (rt-list-call "_rt_gte_all" args env)
+      (= fname "not") (str "!" (truthy (expr (first args) env)))
+      (= fname "str") (rt-list-call "_rt_str" args env)
+      (= fname "pr-str") (rt-list-call "_rt_pr_str_many" args env)
+      (= fname "print") (rt-list-call "_rt_print" args env)
+      (= fname "println") (rt-list-call "_rt_println" args env)
+      (= fname "pr") (rt-list-call "_rt_pr" args env)
+      (= fname "prn") (rt-list-call "_rt_prn" args env)
+      (= fname "assoc") (rt-list-call "_rt_assoc" args env)
+      (= fname "dissoc") (rt-list-call "_rt_dissoc" args env)
+      (= fname "conj") (rt-list-call "_rt_conj" args env)
+      (= fname "merge") (rt-list-call "_rt_merge" args env)
+      (= fname "min") (rt-list-call "_rt_min" args env)
+      (= fname "max") (rt-list-call "_rt_max" args env)
+      (= fname "list") (rt-list-call "_rt_list" args env)
+      (= fname "vector") (rt-list-call "_rt_list" args env)
+      (= fname "hash-map") (rt-list-call "_rt_hash_map" args env)
+      (= fname "set")
+      (if (= n 0) "_rt_set(null)" (str "_rt_set(" (expr (first args) env) ")"))
+      (= fname "apply") (rt-list-call "_rt_apply" args env)
+      (= fname "concat") (rt-list-call "_rt_concat" args env)
+      (= fname "partial")
+      (str "_rt_partial(" (expr (first args) env) ", ["
+           (str/join ", " (map #(expr % env) (rest args)))
+           "])")
+      (= fname "comp") (rt-list-call "_rt_comp" args env)
+      (= fname "juxt") (rt-list-call "_rt_juxt" args env)
+      (= fname "complement") (rt-call "_rt_complement" args env)
+      (= fname "constantly") (rt-call "_rt_constantly" args env)
+      (= fname "atom") (rt-call "_Atom" args env)
+      (= fname "reset!") (rt-call "_rt_reset" args env)
+      (= fname "deref") (rt-call "_rt_deref" args env)
+      (= fname "swap!")
+      (str "_rt_swap(" (expr (first args) env) ", "
+           (expr (second args) env) ", ["
+           (str/join ", " (map #(expr % env) (drop 2 args)))
+           "])")
+      (= fname "get") (rt-call "_rt_get" args env)
+      (= fname "get-in") (rt-call "_rt_get_in" args env)
+      (= fname "nth") (rt-call "_rt_nth" args env)
+      (= fname "subs") (rt-call "_rt_subs" args env)
+      (= fname "assoc-in") (rt-call "_rt_assoc_in" args env)
+      (= fname "update")
+      (str "_rt_update(" (expr (first args) env) ", "
+           (expr (second args) env) ", "
+           (expr (nth args 2) env) ", ["
+           (str/join ", " (map #(expr % env) (drop 3 args)))
+           "])")
+      (= fname "update-in")
+      (str "_rt_update_in(" (expr (first args) env) ", "
+           (expr (second args) env) ", "
+           (expr (nth args 2) env) ", ["
+           (str/join ", " (map #(expr % env) (drop 3 args)))
+           "])")
+      (= fname "range")
+      (cond
+        (= n 1) (str "_rt_range(" (expr (first args) env) ")")
+        (= n 2) (str "_rt_range(" (expr (first args) env) ", "
+                      (expr (second args) env) ")")
+        :else (str "_rt_range(" (expr (first args) env) ", "
+                    (expr (second args) env) ", "
+                    (expr (nth args 2) env) ")"))
+      (= fname "map")
+      (if (= n 2)
+        (str "_rt_map(" (expr (first args) env) ", " (expr (second args) env) ")")
+        (str "_rt_map_multi(" (expr (first args) env) ", ["
+             (str/join ", " (map #(expr % env) (rest args)))
+             "])"))
+      (= fname "mapv")
+      (if (= n 2)
+        (str "_rt_map(" (expr (first args) env) ", " (expr (second args) env) ")")
+        (str "_rt_map_multi(" (expr (first args) env) ", ["
+             (str/join ", " (map #(expr % env) (rest args)))
+             "])"))
+      (= fname "map-indexed")
+      (str "_rt_map_indexed(" (expr (first args) env) ", "
+           (expr (second args) env) ")")
+      (= fname "reduce")
+      (if (= n 2)
+        (str "_rt_reduce2(" (expr (first args) env) ", " (expr (second args) env) ")")
+        (str "_rt_reduce3(" (expr (first args) env) ", "
+             (expr (second args) env) ", " (expr (nth args 2) env) ")"))
+      (= fname "reduce-kv")
+      (str "_rt_reduce_kv(" (expr (first args) env) ", "
+           (expr (second args) env) ", " (expr (nth args 2) env) ")")
+      (= fname "sort-by")
+      (str "_rt_sort_by(" (expr (first args) env) ", " (expr (second args) env) ")")
+      (= fname "sort")
+      (if (= n 2)
+        (str "_rt_sort_by(" (expr (first args) env) ", " (expr (second args) env) ")")
+        (str "_rt_sort(" (expr (first args) env) ")"))
+      (= fname "str/join")
+      (if (= n 2)
+        (str "_rt_join(" (expr (first args) env) ", " (expr (second args) env) ")")
+        (str "_rt_join('', " (expr (first args) env) ")"))
+      (= fname "str/split")
+      (str "_rt_split(" (expr (first args) env) ", " (expr (second args) env) ")")
+      (= fname "str/upper-case") (rt-call "_rt_upper" args env)
+      (= fname "str/lower-case") (rt-call "_rt_lower" args env)
+      (= fname "str/trim") (rt-call "_rt_trim" args env)
+      (= fname "str/triml") (rt-call "_rt_triml" args env)
+      (= fname "str/trimr") (rt-call "_rt_trimr" args env)
+      (= fname "str/capitalize") (rt-call "_rt_capitalize" args env)
+      (= fname "str/blank?") (rt-call "_rt_blank_q" args env)
+      (= fname "str/starts-with?") (rt-call "_rt_starts_with" args env)
+      (= fname "str/ends-with?") (rt-call "_rt_ends_with" args env)
+      (= fname "str/includes?") (rt-call "_rt_includes" args env)
+      (= fname "str/replace") (rt-call "_rt_replace" args env)
+      (= fname "str/replace-first") (rt-call "_rt_replace_first" args env)
+      (contains? core-value-fns fname)
+      (rt-call (get core-value-fns fname) args env)
+      :else nil)))
+
+;; ---------------------------------------------------------------------------
+;; Symbols and namespaces
+;; ---------------------------------------------------------------------------
+
+(defn- resolve-local [sym env]
+  (get env (str sym)))
+
+(defn- resolve-refer [sym env]
+  (get (get env :refers) (str sym)))
+
+(defn- symbol-expr [sym env]
+  (let [s (str sym)
+        local (resolve-local sym env)
+        refer (resolve-refer sym env)]
+    (cond
+      local local
+      refer refer
+      (and (str/includes? s "/") (not= s "/"))
+      (let [ns (namespace sym)
+            nm (name sym)]
+        (cond
+          (= ns "cljd.core") (get core-value-fns nm nm)
+          (= ns "clojure.core") (get core-value-fns nm nm)
+          (= ns (get env :current-ns)) (munge nm)
+          (contains? (get env :imports) ns)
+          (str ns "." (str/replace nm "/" "."))
+          :else (unsupported (str "namespace " ns) sym)))
+      (contains? (get env :globals #{}) s) (munge s)
+      :else (get core-value-fns s (munge s)))))
+
+;; ---------------------------------------------------------------------------
+;; Quoting
+;; ---------------------------------------------------------------------------
+
+(defn- quoted [form env]
+  (cond
+    (symbol? form) (symbol-sym form)
+    (keyword? form) (kw-expr form)
+    (nil? form) "null"
+    (true? form) "true"
+    (false? form) "false"
+    (number? form) (str form)
+    (string? form) (dart-string form)
+    (vector? form) (str "[" (str/join ", " (map #(quoted % env) form)) "]")
+    (set? form) (str "_rt_set(["
+                     (str/join ", " (map #(quoted % env) form))
+                     "])")
+    (map? form) (str "<dynamic, dynamic>{"
+                      (str/join ", " (map (fn [e]
+                                            (str (quoted (nth e 0) env) ": "
+                                                 (quoted (nth e 1) env)))
+                                          (seq form)))
+                      "}")
+    (list? form) (str "_rt_list(["
+                        (str/join ", " (map #(quoted % env) form))
+                        "])")
+    :else (str form)))
+
+;; ---------------------------------------------------------------------------
+;; Threading macros
+;; ---------------------------------------------------------------------------
+
+(defn- thread-first [x forms]
+  (reduce (fn [acc f]
+            (if (list? f)
+              (apply list (first f) acc (rest f))
+              (list f acc)))
+          x forms))
+
+(defn- thread-last [x forms]
+  (reduce (fn [acc f]
+            (if (list? f)
+              (apply list (concat f (list acc)))
+              (list f acc)))
+          x forms))
+
+(defn- expand [form]
+  (if (and (list? form) (symbol? (first form)))
+    (let [h (str (first form))]
+      (cond
+        (= h "->") (expand (thread-first (second form) (drop 2 form)))
+        (= h "->>") (expand (thread-last (second form) (drop 2 form)))
+        (= h "when") (list 'if (second form)
+                          (apply list 'do (drop 2 form)))
+        (= h "when-not") (list 'if (list 'not (second form))
+                              (cons 'do (drop 2 form)))
+        (= h "if-not") (list 'if (list 'not (second form))
+                            (nth form 2)
+                            (when (> (count form) 3) (nth form 3)))
+        :else form))
+    form))
+
+;; ---------------------------------------------------------------------------
+;; Binding forms (let, fn params, loop)
+;; ---------------------------------------------------------------------------
+
+(defn- decl-line [name value]
+  (str "final " name " = " value ";"))
+
+(defn- bind-symbol [sym value env lines]
+  (let [n (fresh (str sym))]
+    [(assoc env (str sym) n) (conj lines (decl-line n value))]))
+
+(defn- default-for [defaults sym tmp key-expr env]
+  (if (contains? defaults sym)
+    (str "_rt_get(" tmp ", " key-expr ", " (expr (get defaults sym) env) ")")
+    (str "_rt_get(" tmp ", " key-expr ")")))
+
+(defn- bind-vector [binding tmp env lines]
+  (loop [bs (vec binding) i 0 env env lines lines]
+    (cond
+      (empty? bs) [env lines]
+      (= (str (first bs)) "&")
+      (let [r (second bs)
+            value (str "_rt_drop(" i ", " tmp ")")
+            [env2 lines2] (bind-pattern r value env lines)]
+        (recur (vec (drop 2 bs)) i env2 lines2))
+      (= (str (first bs)) ":as")
+      (let [s (second bs)
+            [env2 lines2] (bind-pattern s tmp env lines)]
+        (recur (vec (drop 2 bs)) i env2 lines2))
+      :else
+      (let [b (first bs)
+            [env2 lines2] (bind-pattern b (str "_rt_nth(" tmp ", " i ")") env lines)]
+        (recur (vec (rest bs)) (inc i) env2 lines2)))))
+
+(defn- bind-keys [ks kind tmp defaults env lines]
+  (reduce (fn [state sym]
+            (let [[env lines] state
+                  local-name (symbol (name sym))
+                  key-expr (cond
+                             (= kind :keys) (if (namespace sym)
+                                              (str "_Kw(" (dart-string (name sym)) ", "
+                                                   (dart-string (namespace sym)) ")")
+                                              (str "_Kw(" (dart-string (name sym)) ")"))
+                             (= kind :strs) (dart-string (name sym))
+                             :else (if (namespace sym)
+                                     (str "_Sym(" (dart-string (name sym)) ", "
+                                          (dart-string (namespace sym)) ")")
+                                     (str "_Sym(" (dart-string (name sym)) ")")))
+                  value (default-for defaults sym tmp key-expr env)]
+              (bind-pattern local-name value env lines)))
+          [env lines] ks))
+
+(defn- bind-map [binding tmp env lines]
+  (let [defaults (or (get binding :or) {})
+        as (get binding :as)
+        [env0 lines0] (if as (bind-pattern as tmp env lines) [env lines])]
+    (loop [entries (seq binding) env env0 lines lines0]
+      (if (empty? entries)
+        [env lines]
+        (let [e (first entries)
+              k (nth e 0)
+              v (nth e 1)]
+          (cond
+            (= k :as) (recur (rest entries) env lines)
+            (= k :or) (recur (rest entries) env lines)
+            (= k :keys)
+            (let [[env2 lines2] (bind-keys v :keys tmp defaults env lines)]
+              (recur (rest entries) env2 lines2))
+            (= k :strs)
+            (let [[env2 lines2] (bind-keys v :strs tmp defaults env lines)]
+              (recur (rest entries) env2 lines2))
+            (= k :syms)
+            (let [[env2 lines2] (bind-keys v :syms tmp defaults env lines)]
+              (recur (rest entries) env2 lines2))
+            :else
+            (let [key-expr (expr v env)
+                  value (str "_rt_get(" tmp ", " key-expr ")")
+                  [env2 lines2] (bind-pattern k value env lines)]
+              (recur (rest entries) env2 lines2))))))))
+
+(defn- bind-pattern [binding value env lines]
+  (cond
+    (symbol? binding) (bind-symbol binding value env lines)
+    (vector? binding) (bind-vector binding (str "(" value ")") env lines)
+    (map? binding) (bind-map binding (str "(" value ")") env lines)
+    :else (unsupported "binding form" binding)))
+
+(defn- bind-all [bindings env]
+  (loop [pairs (vec (partition 2 bindings)) env env lines []]
+    (if (empty? pairs)
+      [env lines]
+      (let [pair (first pairs)
+            b (nth pair 0)
+            v (nth pair 1)
+            value (expr v env)
+            [env2 lines2] (bind-pattern b value env lines)]
+        (recur (vec (rest pairs)) env2 lines2)))))
+
+(defn- bind-params [params env]
+  (loop [ps (vec params) env env sig [] pre []]
+    (cond
+      (empty? ps) [env sig pre]
+      (= (str (first ps)) "&") (unsupported "variadic fn" params)
+      (symbol? (first ps))
+      (let [p (first ps)
+            n (fresh (str p))]
+        (recur (vec (rest ps))
+               (assoc env (str p) n)
+               (conj sig (str "dynamic " n))
+               pre))
+      :else
+      (let [p (first ps)
+            tmp (fresh "p")
+            [env2 pre2] (bind-pattern p tmp env pre)]
+        (recur (vec (rest ps))
+               env2
+               (conj sig (str "dynamic " tmp))
+               pre2)))))
+
+;; ---------------------------------------------------------------------------
+;; Expression emitter
+;; ---------------------------------------------------------------------------
+
+(defn- emit-lines [lines ind]
+  (join-lines (map #(str (spaces ind) %) lines)))
+
+(defn- let-expr [bindings body env ind]
+  (let [[env2 lines] (bind-all bindings env)]
+    (str "(() {\n"
+         (when (seq lines) (str (emit-lines lines (inc ind)) "\n"))
+         (emit-body body env2 (inc ind)) "\n"
+         (spaces ind) "})()")))
+
+(defn- do-expr [body env ind]
+  (str "(() {\n"
+       (emit-body body env (inc ind)) "\n"
+       (spaces ind) "})()"))
+
+(defn- cond-result [clauses env ind]
+  (let [pairs (vec (partition 2 clauses))]
+    (if (empty? pairs)
+      "null"
+      (let [pair (first pairs)
+            test (nth pair 0)
+            body (nth pair 1)
+            rest-clauses (vec (apply concat (vec (rest pairs))))]
+        (if (or (= (str test) ":else") (true? test))
+          (expr body env)
+          (str "(" (truthy (expr test env)) " ? "
+               (expr body env) " : "
+               (cond-result rest-clauses env ind)
+               ")"))))))
+
+(defn- and-expr [args env ind]
+  (cond
+    (empty? args) "true"
+    (= 1 (count args)) (expr (first args) env)
+    :else
+    (let [names (vec (map (fn [_] (fresh "and")) (range (dec (count args)))))
+          vals (vec (map #(expr % env) (butlast args)))
+          last-expr (expr (last args) env)
+          lines (vec (map (fn [i]
+                            (let [n (nth names i)]
+                              (str "final " n " = " (nth vals i) ";")))
+                     (range (count names))))
+          checks (vec (map (fn [i]
+                             (let [n (nth names i)]
+                               (str (spaces (+ ind 2))
+                                    "if (!_rt_truthy(" n ")) return " n ";")))
+                           (range (count names))))]
+      (str "(() {\n"
+           (emit-lines lines (inc ind)) "\n"
+           (join-lines checks) "\n"
+           (spaces (inc ind)) "return " last-expr ";\n"
+           (spaces ind) "})()"))))
+
+(defn- or-expr [args env ind]
+  (cond
+    (empty? args) "null"
+    (= 1 (count args)) (expr (first args) env)
+    :else
+    (let [names (vec (map (fn [_] (fresh "or")) (range (dec (count args)))))
+          vals (vec (map #(expr % env) (butlast args)))
+          last-expr (expr (last args) env)
+          lines (vec (map (fn [i]
+                            (let [n (nth names i)]
+                              (str "final " n " = " (nth vals i) ";")))
+                     (range (count names))))
+          checks (vec (map (fn [i]
+                             (let [n (nth names i)]
+                               (str (spaces (+ ind 2))
+                                    "if (_rt_truthy(" n ")) return " n ";")))
+                           (range (count names))))]
+      (str "(() {\n"
+           (emit-lines lines (inc ind)) "\n"
+           (join-lines checks) "\n"
+           (spaces (inc ind)) "return " last-expr ";\n"
+           (spaces ind) "})()"))))
+
+(defn- if-expr [test then else env]
+  (str "(" (truthy (expr test env)) " ? "
+       (expr then env) " : "
+       (if (nil? else) "null" (expr else env))
+       ")"))
+
+(defn- fn-expr [form env ind]
+  (let [parts (vec form)
+        named (and (> (count parts) 2) (symbol? (nth parts 1)))
+        fname (when named (nth parts 1))
+        params (if named (nth parts 2) (nth parts 1))
+        body (if named (drop 3 parts) (drop 2 parts))
+        body (if (and (next body) (map? (first body))) (rest body) body)
+        [env2 sig pre] (bind-params params env)]
+    (if named
+      (let [f (fresh (str fname))
+            env3 (assoc env2 :loop f)]
+        (str "(() {\n"
+             (spaces (inc ind)) "dynamic " f "(" (str/join ", " sig) ") {\n"
+             (when (seq pre) (str (emit-lines pre (+ ind 2)) "\n"))
+             (emit-body body env3 (+ ind 2)) "\n"
+             (spaces (inc ind)) "}\n"
+             (spaces (inc ind)) "return " f ";\n"
+             (spaces ind) "})()"))
+      (str "((" (str/join ", " sig) ") {\n"
+           (when (seq pre) (str (emit-lines pre (+ ind 2)) "\n"))
+           (emit-body body env2 (+ ind 2)) "\n"
+           (spaces ind) "})"))))
+
+(defn- loop-expr [bindings body env ind]
+  (when (odd? (count bindings)) (unsupported "odd loop bindings" bindings))
+  (let [pairs (vec (partition 2 bindings))
+        f (fresh "loop")
+        outer-env env
+        [env2 sig inits]
+        (loop [ps pairs env env sig [] inits []]
+          (if (empty? ps)
+            [env sig inits]
+            (let [pair (first ps)
+                  sym (nth pair 0)
+                  init (nth pair 1)]
+              (if (symbol? sym)
+                (let [p (fresh (str sym))]
+                  (recur (vec (rest ps))
+                         (assoc env (str sym) p)
+                         (conj sig (str "dynamic " p))
+                         (conj inits (expr init outer-env))))
+                (unsupported "destructuring loop binding" sym)))))]
+    (str "(() {\n"
+         (spaces (inc ind)) "dynamic " f "(" (str/join ", " sig) ") {\n"
+         (emit-body body (assoc env2 :loop f) (+ ind 2)) "\n"
+         (spaces (inc ind)) "}\n"
+         (spaces (inc ind)) "return " f "(" (str/join ", " inits) ");\n"
+         (spaces ind) "})()")))
+
+(defn- case-expr [form env ind]
+  (let [target (nth form 1)
+        clauses (drop 2 form)
+        pairs (vec (partition 2 clauses))
+        has-default (odd? (count clauses))
+        default (when has-default (last clauses))
+        t (fresh "case")]
+    (str "(() {\n"
+         (emit-lines [(decl-line t (expr target env))] (inc ind)) "\n"
+         (join-lines
+          (map (fn [pair]
+                 (let [test (nth pair 0)
+                       body (nth pair 1)
+                       cond (if (list? test)
+                              (str "_rt_in([" (str/join ", " (map #(expr % env) test)) "], " t ")")
+                              (str "_rt_eq(" t ", " (expr test env) ")"))]
+                   (str (spaces (inc ind)) "if (" cond ") return " (expr body env) ";")))
+               pairs))
+         (when has-default
+           (str "\n" (spaces (inc ind)) "return " (expr default env) ";"))
+         (when-not has-default
+           (str "\n" (spaces (inc ind))
+                "throw Exception('case: no matching clause');"))
+         "\n" (spaces ind) "})()")))
+
+(defn- interop-call [head args env]
+  (let [h (str head)]
+    (cond
+      (str/starts-with? h ".-")
+      (let [obj (first args)
+            field (subs h 2)]
+        (str (expr obj env) "." field))
+      (str/starts-with? h ".")
+      (let [obj (first args)
+            method (subs h 1)
+            more (rest args)]
+        (str (expr obj env) "." method
+             "(" (str/join ", " (map #(expr % env) more)) ")"))
+      :else nil)))
+
+(defn- dot-call [args env]
+  (let [obj (first args)
+        method (second args)
+        more (drop 2 args)]
+    (str (expr obj env) "." (str method)
+         "(" (str/join ", " (map #(expr % env) more)) ")")))
+
+(defn- constructor-name [sym]
+  (let [s (str sym)]
+    (if (str/ends-with? s ".")
+      (subs s 0 (dec (count s)))
+      s)))
+
+(defn- call-expr [head args env ind]
+  (cond
+    (keyword? head)
+    (str "_rt_get(" (expr (first args) env) ", " (kw-expr head)
+         (when (> (count args) 1) (str ", " (expr (second args) env)))
+         ")")
+
+    (or (map? head) (vector? head) (set? head))
+    (str "_rt_get(" (expr head env) ", " (expr (first args) env)
+         (when (> (count args) 1) (str ", " (expr (second args) env)))
+         ")")
+
+    (symbol? head)
+    (let [h (str head)]
+      (cond
+        (= h ".") (dot-call args env)
+        (str/starts-with? h ".-") (interop-call head args env)
+        (str/starts-with? h ".") (interop-call head args env)
+        (and (str/includes? h "/") (not= h "/"))
+        (let [ns (namespace head)
+              nm (name head)]
+          (cond
+            (= ns "cljd.core")
+            (or (core-call nm args env)
+                (unsupported (str "cljd.core/" nm) head))
+
+            (= ns "clojure.core")
+            (or (core-call nm args env)
+                (unsupported (str "clojure.core/" nm) head))
+
+            (= ns "cljd.string")
+            (or (core-call (str "str/" nm) args env)
+                (unsupported (str "cljd.string/" nm) head))
+
+            (= ns "cljd.set")
+            (or (core-call (str "set/" nm) args env)
+                (unsupported (str "cljd.set/" nm) head))
+
+            (= ns (get env :current-ns))
+            (str "_rt_invoke(" (munge nm) ", ["
+                 (str/join ", " (map #(expr % env) args)) "])")
+
+            (contains? (get env :imports) ns)
+            (let [imported (get (get env :imports) ns)]
+              (cond
+                (= imported "cljd.string")
+                (or (core-call (str "str/" nm) args env)
+                    (unsupported (str "cljd.string/" nm) head))
+                (= imported "cljd.set")
+                (or (core-call (str "set/" nm) args env)
+                    (unsupported (str "cljd.set/" nm) head))
+                :else
+                (let [member (str/replace nm "/" ".")
+                      callee (str ns "." member)]
+                  (str callee "("
+                       (str/join ", " (map #(expr % env) args)) ")"))))
+
+            :else (unsupported (str "namespace " ns) head)))
+
+        (str/ends-with? h ".")
+        (str (munge (constructor-name head))
+             "(" (str/join ", " (map #(expr % env) args)) ")")
+
+        (re-matches #"[A-Z].*" h)
+        (str (munge h)
+             "(" (str/join ", " (map #(expr % env) args)) ")")
+
+        :else
+        (or (when-not (contains? (get env :globals #{}) h)
+              (core-call h args env))
+            (str "_rt_invoke(" (symbol-expr head env) ", ["
+                 (str/join ", " (map #(expr % env) args)) "])"))))
+
+    :else
+    (str "_rt_invoke(" (expr head env) ", ["
+         (str/join ", " (map #(expr % env) args)) "])")))
+
+(defn- special-form [form env ind]
+  (let [h (str (first form))
+        args (rest form)]
+    (cond
+      (= h "if") (if-expr (first args) (second args)
+                          (when (> (count args) 2) (nth args 2)) env)
+      (= h "if-not") (if-expr (list 'not (first args)) (second args)
+                              (when (> (count args) 2) (nth args 2)) env)
+      (= h "when") (if-expr (first args) (cons 'do (rest args)) nil env)
+      (= h "when-not") (if-expr (list 'not (first args)) (cons 'do (rest args)) nil env)
+      (= h "cond") (cond-result (vec args) env ind)
+      (= h "do") (do-expr args env ind)
+      (= h "let") (let-expr (first args) (rest args) env ind)
+      (= h "fn") (fn-expr form env ind)
+      (= h "fn*") (fn-expr form env ind)
+      (= h "loop") (loop-expr (first args) (rest args) env ind)
+      (= h "not") (str "!" (truthy (expr (first args) env)))
+      (= h "and") (and-expr (vec args) env ind)
+      (= h "or") (or-expr (vec args) env ind)
+      (= h "quote") (quoted (first args) env)
+      (= h "case") (case-expr form env ind)
+      (= h "comment") "null"
+      (= h "new") (str (munge (str (first args)))
+                       "(" (str/join ", " (map #(expr % env) (rest args))) ")")
+      (= h "throw") (str "(() { throw " (expr (first args) env) "; })()")
+      (= h "recur")
+      (let [f (get env :loop)]
+        (if f
+          (str f "(" (str/join ", " (map #(expr % env) args)) ")")
+          (unsupported "recur outside loop/fn" form)))
+      (= h "deref") (str "_rt_deref(" (expr (first args) env) ")")
+      (= h "atom") (str "_Atom(" (expr (first args) env) ")")
+      (= h "set!")
+      (let [target (first args)
+            value (expr (second args) env)]
+        (if (and (list? target) (symbol? (first target))
+                 (str/starts-with? (str (first target)) ".-"))
+          (str (expr (second target) env) "."
+               (subs (str (first target)) 2) " = " value)
+          (str (expr target env) " = " value)))
+      (= h ".") (dot-call args env)
+      (= h "..") (unsupported ".. interop" form)
+      (= h "try") (try-expr (vec args) env ind)
+      (= h "for") (unsupported "for comprehension" form)
+      (= h "doseq") (doseq-expr (first args) (rest args) env ind)
+      (= h "ns") (unsupported "nested ns" form)
+      (= h "def") (unsupported "nested def" form)
+      (= h "defn") (unsupported "nested defn" form)
+      :else nil)))
+
+(defn expr [form env]
+  (let [form (expand form)]
+    (cond
+      (nil? form) "null"
+      (true? form) "true"
+      (false? form) "false"
+      (number? form) (str form)
+      (string? form) (dart-string form)
+      (keyword? form) (kw-expr form)
+      (symbol? form) (symbol-expr form env)
+      (vector? form) (str "[" (str/join ", " (map #(expr % env) form)) "]")
+      (set? form) (str "_rt_set(["
+                       (str/join ", " (map #(expr % env) form))
+                       "])")
+      (map? form) (str "<dynamic, dynamic>{"
+                        (str/join ", "
+                                  (map (fn [e]
+                                         (str (expr (nth e 0) env) ": "
+                                              (expr (nth e 1) env)))
+                                       (seq form)))
+                        "}")
+      (list? form)
+      (if (empty? form)
+        "<dynamic>[]"
+        (let [h (first form)]
+          (if (symbol? h)
+            (or (special-form form env 0)
+                (call-expr h (rest form) env 0))
+            (call-expr h (rest form) env 0))))
+      :else (str form))))
+
+;; ---------------------------------------------------------------------------
+;; Statement emitter
+;; ---------------------------------------------------------------------------
+
+(defn- stmt-block [form env ind]
+  (if (and (list? form) (symbol? (first form))
+           (= (str (first form)) "do"))
+    (join-lines (map #(stmt % env ind) (rest form)))
+    (stmt form env ind)))
+
+(defn- if-stmt [test then else env ind]
+  (str (spaces ind) "if (_rt_truthy(" (expr test env) ")) {\n"
+       (stmt-block then env (inc ind)) "\n"
+       (spaces ind) "}"
+       (when else
+         (str " else {\n"
+              (stmt-block else env (inc ind)) "\n"
+              (spaces ind) "}"))))
+
+(defn- cond-stmt [clauses env ind]
+  (let [pairs (vec (partition 2 clauses))]
+    (if (empty? pairs)
+      (str (spaces ind) ";")
+      (let [pair (first pairs)
+            test (nth pair 0)
+            body (nth pair 1)
+            rest-clauses (vec (apply concat (vec (rest pairs))))]
+        (if (or (= (str test) ":else") (true? test))
+          (stmt-block body env ind)
+          (str (spaces ind) "if (_rt_truthy(" (expr test env) ")) {\n"
+               (stmt-block body env (inc ind)) "\n"
+               (spaces ind) "}"
+               (when (seq rest-clauses)
+                 (str " else {\n"
+                      (cond-stmt rest-clauses env (inc ind)) "\n"
+                      (spaces ind) "}"))))))))
+
+(defn- let-stmt [bindings body env ind]
+  (let [[env2 lines] (bind-all bindings env)]
+    (str (spaces ind) "{\n"
+         (when (seq lines) (str (emit-lines lines (inc ind)) "\n"))
+         (join-lines (map #(stmt % env2 (inc ind)) body)) "\n"
+         (spaces ind) "}")))
+
+(defn- doseq-expr [bindings body env ind]
+  (str "(() {\n"
+       (doseq-stmt bindings body env (inc ind)) "\n"
+       (spaces (inc ind)) "return null;\n"
+       (spaces ind) "})()"))
+
+(defn- try-expr [args env ind]
+  (let [[body catches finally]
+        (loop [xs (vec args) body [] catches [] finally nil]
+          (if (empty? xs)
+            [body catches finally]
+            (let [x (first xs)
+                  h (when (and (list? x) (symbol? (first x))) (str (first x)))]
+              (cond
+                (= h "catch")
+                (recur (vec (rest xs)) body (conj catches (vec (rest x))) finally)
+                (= h "finally")
+                (recur (vec (rest xs)) body catches (vec (rest x)))
+                :else
+                (recur (vec (rest xs)) (conj body x) catches finally)))))]
+    (str "(() {\n"
+         (spaces (inc ind)) "try {\n"
+         (emit-body body env (+ ind 2)) "\n"
+         (spaces (inc ind)) "}"
+         (join-lines
+          (map (fn [clause]
+                 (let [typed? (>= (count clause) 3)
+                       type-expr (when typed? (expr (nth clause 0) env))
+                       binding (if typed? (nth clause 1) (nth clause 0))
+                       handler-body (if typed? (drop 2 clause) (rest clause))
+                       v (fresh (str binding))
+                       env2 (assoc env (str binding) v)]
+                   (str (when typed? (str " on " type-expr))
+                        " catch (" v ") {\n"
+                        (emit-body handler-body env2 (+ ind 2)) "\n"
+                        (spaces (inc ind)) "}")))
+               catches))
+         (when (seq finally)
+           (str " finally {\n"
+                (join-lines (map #(stmt % env (+ ind 2)) finally)) "\n"
+                (spaces (inc ind)) "}"))
+         "\n" (spaces ind) "})()")))
+
+(defn- doseq-stmt [bindings body env ind]
+  (when (odd? (count bindings))
+    (unsupported "odd doseq bindings" bindings))
+  (let [pairs (vec (partition 2 bindings))]
+    (if (empty? pairs)
+      (join-lines (map #(stmt % env ind) body))
+      (let [pair (first pairs)
+            binding (nth pair 0)
+            coll (nth pair 1)
+            item (fresh "item")
+            [env2 lines] (bind-pattern binding item env [])
+            rest-bindings (vec (apply concat (vec (rest pairs))))]
+        (str (spaces ind) "for (final " item " in _rt_as_list(" (expr coll env) ")) {\n"
+             (when (seq lines) (str (emit-lines lines (inc ind)) "\n"))
+             (doseq-stmt rest-bindings body env2 (inc ind)) "\n"
+             (spaces ind) "}")))))
+
+(defn stmt [form env ind]
+  (let [form (expand form)]
+    (if (and (list? form) (symbol? (first form)))
+      (let [h (str (first form))
+            args (rest form)]
+        (cond
+          (= h "if") (if-stmt (first args) (second args)
+                              (when (> (count args) 2) (nth args 2)) env ind)
+          (= h "if-not") (if-stmt (list 'not (first args)) (second args)
+                                  (when (> (count args) 2) (nth args 2)) env ind)
+          (= h "when") (if-stmt (first args) (cons 'do (rest args)) nil env ind)
+          (= h "when-not") (if-stmt (list 'not (first args)) (cons 'do (rest args)) nil env ind)
+          (= h "cond") (cond-stmt (vec args) env ind)
+          (= h "do") (stmt-block form env ind)
+          (= h "let") (let-stmt (first args) (rest args) env ind)
+          (= h "doseq") (doseq-stmt (first args) (rest args) env ind)
+          (= h "recur")
+          (let [f (get env :loop)]
+            (if f
+              (str (spaces ind) "return " f
+                   "(" (str/join ", " (map #(expr % env) args)) ");")
+              (unsupported "recur outside loop/fn" form)))
+          (= h "throw")
+          (str (spaces ind) "throw " (expr (first args) env) ";")
+          (= h "comment") ""
+          (= h "ns") ""
+          (= h "def") (unsupported "nested def" form)
+          (= h "defn") (unsupported "nested defn" form)
+          :else (str (spaces ind) (expr form env) ";")))
+      (str (spaces ind) (expr form env) ";"))))
+
+(defn- emit-body [forms env ind]
+  (let [forms (vec forms)]
+    (if (empty? forms)
+      (str (spaces ind) "return null;")
+      (let [init (butlast forms)
+            last-form (peek forms)]
+        (str (when (seq init)
+               (str (join-lines (map #(stmt % env ind) init)) "\n"))
+             (spaces ind) "return " (expr last-form env) ";")))))
+
+;; ---------------------------------------------------------------------------
+;; Top-level forms
+;; ---------------------------------------------------------------------------
+
+
+(defn- defn-form [form env private?]
+  (let [nm (second form)
+        tail (drop 2 form)
+        tail (if (and (> (count tail) 1) (string? (first tail))) (rest tail) tail)
+        tail (if (and (seq tail) (map? (first tail))) (rest tail) tail)
+        params (first tail)
+        body (rest tail)
+        body (if (and (next body) (map? (first body))) (rest body) body)
+        name (if private? (str "_" (munge (str nm))) (munge (str nm)))
+        [env2 sig pre] (bind-params params env)]
+    (when (and (seq body)
+               (every? (fn [x] (and (list? x) (vector? (first x)))) body))
+      (unsupported "multi-arity defn" form))
+    (str "dynamic " name "(" (str/join ", " sig) ") {\n"
+         (when (seq pre) (str (emit-lines pre 1) "\n"))
+         (emit-body body env2 1) "\n"
+         "}")))
+
+(defn- def-form [form env private?]
+  (let [nm (second form)
+        tail (drop 2 form)
+        tail (if (and (> (count tail) 1) (string? (first tail))) (rest tail) tail)
+        tail (if (and (seq tail) (map? (first tail))) (rest tail) tail)
+        value (first tail)
+        name (if private? (str "_" (munge (str nm))) (munge (str nm)))]
+    (if (nil? value)
+      (str "dynamic " name ";")
+      (str "dynamic " name " = " (expr value env) ";"))))
+
+(defn- top-form [form env]
+  (let [form (expand form)]
+    (if (and (list? form) (symbol? (first form)))
+      (let [h (str (first form))
+            nm (when (> (count form) 1) (second form))]
+        (cond
+          (= h "ns") ""
+          (= h "comment") ""
+          (= h "do") (join-lines (map #(top-form % env) (rest form)))
+          (= h "def") (def-form form env (= true (:private (meta nm))))
+          (= h "defonce") (def-form form env (= true (:private (meta nm))))
+          (= h "defn") (defn-form form env (= true (:private (meta nm))))
+          (= h "defn-") (defn-form form env true)
+          (= h "defmacro") (unsupported "defmacro" form)
+          :else (stmt form env 0)))
+      (stmt form env 0))))
+
+;; ---------------------------------------------------------------------------
+;; ns / imports
+;; ---------------------------------------------------------------------------
+
+(defn- parse-require-spec [spec imports aliases refers]
+  (let [lib (first spec)
+        opts (vec (rest spec))]
+    (if (string? lib)
+      (let [as (loop [i 0 a nil]
+                 (if (< i (count opts))
+                   (if (= (nth opts i) :as)
+                     (nth opts (inc i))
+                     (recur (+ i 2) a))
+                   a))
+            refer (loop [i 0 r []]
+                    (if (< i (count opts))
+                      (if (= (nth opts i) :refer)
+                        (vec (nth opts (inc i)))
+                        (recur (+ i 2) r))
+                      r))
+            alias-name (when as (str as))
+            import-line (str "import " (dart-string lib)
+                             (if alias-name (str " as " alias-name) "")
+                             (if (and (seq refer) (nil? as))
+                               (str " show " (str/join ", " (map str refer)))
+                               "")
+                             ";")
+            refers2 (if (and alias-name (seq refer))
+                      (reduce (fn [m x]
+                                (assoc m (str x) (str alias-name "." (str x))))
+                              refers refer)
+                      refers)]
+        [(conj imports import-line)
+         (if alias-name (assoc aliases alias-name true) aliases)
+         refers2])
+      (let [lib-str (str lib)
+            alias-name (loop [i 0 a nil]
+                         (if (< i (count opts))
+                           (if (= (nth opts i) :as)
+                             (nth opts (inc i))
+                             (recur (+ i 2) a))
+                           a))
+            a (when alias-name (str alias-name))]
+        (cond
+          (or (= lib-str "cljd.core") (= lib-str "clojure.core"))
+          [imports aliases refers]
+          (= lib-str "cljd.string")
+          [imports (assoc aliases (or a "str") "cljd.string") refers]
+          (= lib-str "cljd.set")
+          [imports (assoc aliases (or a "set") "cljd.set") refers]
+          :else (unsupported (str "required namespace " lib-str) spec))))))
+
+(defn- parse-ns [form]
+  (let [nm (second form)
+        tail (drop 2 form)
+        clauses (filter list? tail)]
+    (loop [cs (vec clauses) imports [] aliases {} refers {}]
+      (if (empty? cs)
+        [imports aliases refers (str nm)]
+        (let [clause (first cs)
+              kw (first clause)]
+          (if (= kw :require)
+            (let [[imports2 aliases2 refers2]
+                  (reduce (fn [state spec]
+                            (let [[imports aliases refers] state]
+                              (parse-require-spec spec imports aliases refers)))
+                          [imports aliases refers]
+                          (rest clause))]
+              (recur (vec (rest cs)) imports2 aliases2 refers2))
+            (recur (vec (rest cs)) imports aliases refers)))))))
+
+;; ---------------------------------------------------------------------------
+;; Public API
+;; ---------------------------------------------------------------------------
+
+(def ^:private placeholder-prev
+  #{"(" "[" "{" "," " " "\t" "\n" "\r"})
+
+(def ^:private placeholder-next
+  #{"(" ")" "[" "]" "{" "}" "," ";" " " "\t" "\n" "\r"})
+
+(defn normalize-percent-args
+  "Work around a bug in the ClojureDart reader used by this project: a bare
+  `%` inside `#(...)` is rejected, while `%1` works. Rewrite standalone `%`
+  tokens to `%1` outside strings and comments."
+  [src]
+  (let [n (count src)
+        sb (StringBuffer.)]
+    (loop [i 0 state :code]
+      (if (>= i n)
+        (.toString sb)
+        (let [ch (subs src i (inc i))
+              next-ch (when (< (inc i) n) (subs src (inc i) (+ i 2)))
+              prev-ch (when (> i 0) (subs src (dec i) i))]
+          (cond
+            (= state :string)
+            (do
+              (.write sb ch)
+              (cond
+                (= ch "\\") (do (when next-ch (.write sb next-ch))
+                                (recur (+ i 2) :string))
+                (= ch "\"") (recur (inc i) :code)
+                :else (recur (inc i) :string)))
+
+            (= state :comment)
+            (do
+              (.write sb ch)
+              (recur (inc i) (if (= ch "\n") :code :comment)))
+
+            (= ch "\"")
+            (do (.write sb ch) (recur (inc i) :string))
+
+            (= ch ";")
+            (do (.write sb ch) (recur (inc i) :comment))
+
+            (= ch "\\")
+            (do
+              (.write sb ch)
+              (when next-ch (.write sb next-ch))
+              (recur (+ i 2) :code))
+
+            (and (= ch "%")
+                 (or (nil? prev-ch) (contains? placeholder-prev prev-ch))
+                 (or (nil? next-ch) (contains? placeholder-next next-ch)))
+            (do (.write sb "%1") (recur (inc i) :code))
+
+            :else
+            (do (.write sb ch) (recur (inc i) :code))))))))
+
+(defn- ns-form? [form]
+  (and (list? form) (symbol? (first form)) (= (str (first form)) "ns")))
+
+(defn transpile-forms
+  "Transpile a sequence of already-read ClojureDart forms into Dart source."
+  [forms opts]
+  (let [forms (vec forms)
+        ns-form (first (filter ns-form? forms))
+        [imports aliases refers current-ns]
+        (if ns-form (parse-ns ns-form) [[] {} {} nil])
+        env {:imports aliases :refers refers :current-ns current-ns}
+        body-forms (remove ns-form? forms)
+        body (join-lines (map #(top-form % env) body-forms))
+        source (get opts :source-name "<input>")
+        header (str "// GENERATED by cljd2dart. Do not edit.\n"
+                    "// Source: " source "\n"
+                    "//\n"
+                    "// This file was produced by a small source-to-source transpiler\n"
+                    "// written in ClojureDart. See tools/cljd2dart/README.md.\n"
+                    "// ignore_for_file: type=lint, unnecessary_cast, "
+                    "unused_import, unused_local_variable, unused_element, dead_code\n"
+                    "import 'dart:io' as _rt_io;\n"
+                    "import 'dart:math' as _rt_math;\n"
+                    (join-lines imports)
+                    "\n\n")]
+    (str header body "\n\n"
+         "// ---------------------------------------------------------------------------\n"
+         "// cljd2dart runtime\n"
+         "// ---------------------------------------------------------------------------\n\n"
+         rt/runtime-source
+         "\n")))
+
+;; ---------------------------------------------------------------------------
+;; REPL support
+;; ---------------------------------------------------------------------------
+;;
+;; A REPL session is one Dart library that is hot reloaded for every form (see
+;; cljd2dart.repl). Hot reload keeps the value of existing top-level variables
+;; but does not re-run their initializers, so every definition becomes an
+;; untyped top-level variable that is assigned inside `_repl_eval`. This also
+;; gives Clojure's late binding: redefining a function affects its callers.
+
+(def ^:private repl-host
+  "Runs in the session VM. `_repl_eval` is looked up afresh on each call, so
+  the extension always runs the most recently reloaded form."
+  "
+Future<void> cljd_repl_host(String infoPath) async {
+  _rt_io.ProcessSignal.sigint.watch().listen((_) {});
+  _repl_dev.registerExtension('ext.cljd.eval', (method, params) async {
+    final out = <String, dynamic>{};
+    try {
+      final v = _repl_eval();
+      out['value'] = _rt_pr_str1(v);
+      _STAR_3 = _STAR_2;
+      _STAR_2 = _STAR_1;
+      _STAR_1 = v;
+    } catch (e) {
+      _STAR_e = e;
+      out['error'] = '$e';
+    }
+    await _rt_io.stdout.flush();
+    await _rt_io.stderr.flush();
+    return _repl_dev.ServiceExtensionResponse.result(_repl_json.jsonEncode(out));
+  });
+  final info = await _repl_dev.Service.controlWebServer(
+      enable: true, silenceOutput: true);
+  final tmp = _rt_io.File('$infoPath.tmp');
+  tmp.writeAsStringSync('${info.serverUri}');
+  tmp.renameSync(infoPath);
+}
+")
+
+(def repl-host-main
+  "Entry point of the session VM. It lives in its own file so that a user
+  definition named `main` cannot collide with it."
+  "import 'session.dart' as session;
+
+void main(List<String> args) => session.cljd_repl_host(args[0]);
+")
+
+(defn repl-state
+  "The initial compiler state of a REPL session."
+  []
+  {:ns "user"
+   :imports []
+   :aliases {"str" "cljd.string" "set" "cljd.set"}
+   :refers {}
+   :decls #{"*1" "*2" "*3" "*e"}})
+
+(defn- repl-env [state]
+  {:imports (:aliases state)
+   :refers (:refers state)
+   :current-ns (:ns state)
+   :globals (:decls state)})
+
+(defn- repl-require [state specs]
+  (let [[imports aliases refers]
+        (reduce (fn [acc spec]
+                  (let [[imports aliases refers] acc]
+                    (parse-require-spec spec imports aliases refers)))
+                [(:imports state) (:aliases state) (:refers state)]
+                specs)]
+    (assoc state :imports (vec (distinct imports)) :aliases aliases
+           :refers refers)))
+
+(defn- repl-ns [state form]
+  (repl-require (assoc state :ns (str (second form)))
+                (mapcat rest (filter (fn [c] (and (list? c) (= :require (first c))))
+                                     (drop 2 form)))))
+
+(defn- unquote-form [form]
+  (if (and (list? form) (= "quote" (str (first form)))) (second form) form))
+
+(defn- strip-def-tail
+  "Drop the optional docstring and attribute map after a definition's name."
+  [tail]
+  (let [tail (if (and (next tail) (string? (first tail))) (rest tail) tail)]
+    (if (and (next tail) (map? (first tail))) (rest tail) tail)))
+
+(defn- repl-assign [state nm value-form]
+  (let [state (update state :decls conj (str nm))
+        value (expr value-form (repl-env state))]
+    {:state state
+     :body (str "  " (munge (str nm)) " = " value ";\n  return null;")
+     :echo (str "#'" (:ns state) "/" nm)}))
+
+(defn repl-compile
+  "Compile one top-level form. Returns {:state s :body dart :echo text}, where
+  body is the Dart body of `_repl_eval`, and echo, when present, is printed
+  instead of the form's value."
+  [state form]
+  (let [form (expand form)
+        h (when (and (list? form) (seq form) (symbol? (first form)))
+            (str (first form)))
+        args (when h (rest form))
+        nm (when (seq args) (first args))]
+    (cond
+      (= h "ns") {:state (repl-ns state form) :body "  return null;"}
+
+      (= h "require")
+      {:state (repl-require state (map unquote-form args))
+       :body "  return null;"}
+
+      (= h "declare")
+      {:state (update state :decls into (map str args))
+       :body "  return null;"}
+
+      (or (= h "def") (= h "defonce"))
+      (let [tail (strip-def-tail (rest args))]
+        (if (or (empty? tail)
+                (and (= h "defonce") (contains? (:decls state) (str nm))))
+          {:state (update state :decls conj (str nm))
+           :body "  return null;"
+           :echo (str "#'" (:ns state) "/" nm)}
+          (repl-assign state nm (first tail))))
+
+      (or (= h "defn") (= h "defn-"))
+      (let [tail (strip-def-tail (rest args))]
+        (when-not (vector? (first tail))
+          (unsupported "multi-arity defn" form))
+        (repl-assign state nm (list* 'fn nm tail)))
+
+      (= h "defmacro") (unsupported "defmacro" form)
+
+      :else {:state state
+             :body (str "  return " (expr form (repl-env state)) ";")})))
+
+(defn repl-source
+  "The complete Dart source of a session, with body as its current form."
+  [state body]
+  (str "// GENERATED by the cljd2dart REPL.\n"
+       "// ignore_for_file: type=lint\n"
+       "import 'dart:convert' as _repl_json;\n"
+       "import 'dart:developer' as _repl_dev;\n"
+       "import 'dart:io' as _rt_io;\n"
+       "import 'dart:math' as _rt_math;\n"
+       (join-lines (:imports state))
+       "\n\n"
+       (str/join "\n" (map #(str "dynamic " (munge %) ";") (sort (:decls state))))
+       "\n\ndynamic _repl_eval() {\n" body "\n}\n"
+       repl-host
+       "\n"
+       rt/runtime-source
+       "\n"))

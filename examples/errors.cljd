@@ -1,0 +1,20 @@
+(ns errors.core)
+
+(defn safe-div [a b]
+  (try
+    (if (= b 0)
+      (throw (Exception. "divide by zero"))
+      (/ a b))
+    (catch Exception e
+      (println "caught:" e)
+      :error)
+    (finally
+      (println "cleanup"))))
+
+(defn main []
+  (println (safe-div 10 2))
+  (println (safe-div 1 0))
+  (try
+    (println "no exception")
+    (catch e
+      (println "untyped catch:" e))))

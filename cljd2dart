@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Rebuild (when needed) and run the cljd2dart transpiler.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# runtime.dart is embedded in a generated ClojureDart namespace. Keep the
+# generated file in sync before compiling.
+if [ runtime.dart -nt src/cljd2dart/runtime_src.cljd ]; then
+  python3 scripts/embed_runtime.py >/dev/null
+fi
+
+needs_build=0
+if [ ! -f lib/cljd-out/cljd2dart/main.dart ]; then
+  needs_build=1
+elif [ -n "$(find src -name '*.cljd' -newer lib/cljd-out/cljd2dart/main.dart -print -quit)" ]; then
+  needs_build=1
+fi
+
+if [ "$needs_build" -eq 1 ]; then
+  clojure -M:cljd compile
+fi
+
+# Line editing and history for the REPL, when rlwrap is available.
+if [[ " $* " == *" --repl "* ]] && [ -t 0 ] && command -v rlwrap >/dev/null; then
+  exec rlwrap -m -q '"' dart run bin/cljd2dart.dart "$@"
+fi
+
+exec dart run bin/cljd2dart.dart "$@"

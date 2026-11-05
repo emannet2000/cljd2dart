@@ -1,0 +1,6 @@
+cleanup
+5.0
+caught: Exception: divide by zero
+cleanup
+:error
+no exception
